@@ -16,7 +16,7 @@ const (
 	MinOverlap  = 5
 	TopN        = 500
 	NumWorkers  = 16
-	RatingsPath = "ml-1m/ratings.dat"
+	RatingsPath = "ml-10m/ratings.dat"
 	ColdThresh  = 10 // menos de 10 ratings = cold-start
 )
 
@@ -33,7 +33,7 @@ type Sim struct {
 }
 
 // Lectura ratings.dat
-func readRatings(path string) [][3]int {
+func readRatings(path string, max int) [][3]int {
 	f, err := os.Open(path)
 	if err != nil {
 		panic(err)
@@ -41,7 +41,15 @@ func readRatings(path string) [][3]int {
 	defer f.Close()
 
 	sc := bufio.NewScanner(f)
-	out := make([][3]int, 0, 1000209)
+
+	var out [][3]int
+	if max > 0 {
+		out = make([][3]int, 0, max)
+	} else {
+		// capacidad por defecto si no quieres limitar
+		out = make([][3]int, 0, 100000)
+	}
+
 	for sc.Scan() {
 		parts := strings.Split(sc.Text(), "::")
 		if len(parts) != 4 {
@@ -52,7 +60,16 @@ func readRatings(path string) [][3]int {
 		r, _ := strconv.Atoi(parts[2])
 		if r >= 1 && r <= 5 {
 			out = append(out, [3]int{u, i, r})
+
+			// aquí está la diferencia clave
+			if max > 0 && len(out) >= max {
+				break
+			}
 		}
+	}
+
+	if err := sc.Err(); err != nil {
+		panic(err)
 	}
 	return out
 }
@@ -401,34 +418,29 @@ func abs(x float64) float64 {
 
 // main
 func main() {
-	t0 := time.Now()
-	fmt.Println("=== User-Based CF ===")
+	for _, max := range []int{1000000, 2000000, 5000000} {
+		fmt.Printf("\n=== Experimento con maxRatings=%d ===\n", max)
 
-	ratings := readRatings(RatingsPath)
-	fmt.Printf("Ratings: %d\n", len(ratings))
+		t0 := time.Now()
+		ratings := readRatings(RatingsPath, max)
+		fmt.Printf("Ratings cargados: %d\n", len(ratings))
+		fmt.Printf("NumWorkers=%d\n", NumWorkers)
 
-	userRaw := buildUserRaw(ratings)
-	means := userMeans(userRaw)
-	userNorm := buildUserNorm(userRaw, means)
-	inv := buildInverted(userRaw)
-	global := globalTopMovies(userRaw)
-	fmt.Printf("Usuarios: %d | Ítems distintos: %d\n", len(userRaw), len(inv))
-	fmt.Printf("Parámetros → NumWorkers=%d | TopN=%d | MinOverlap=%d | KNeighbors=%d\n", NumWorkers, TopN, MinOverlap, KNeighbors)
+		userRaw := buildUserRaw(ratings)
+		means := userMeans(userRaw)
+		userNorm := buildUserNorm(userRaw, means)
+		inv := buildInverted(userRaw)
+		global := globalTopMovies(userRaw)
 
-	t1 := time.Now()
-	neighbors := topKNeighbors(userNorm, inv)
-	fmt.Printf("Top-K vecinos calculados en %.2fs\n", time.Since(t1).Seconds())
+		t1 := time.Now()
+		neighbors := topKNeighbors(userNorm, inv)
+		tVecinos := time.Since(t1).Seconds()
 
-	t2 := time.Now()
-	recs := predictForUsers(userRaw, means, neighbors, global)
-	fmt.Printf("Predicciones y Top-%d en %.2fs\n", TopN, time.Since(t2).Seconds())
+		t2 := time.Now()
+		_ = predictForUsers(userRaw, means, neighbors, global)
+		tPred := time.Since(t2).Seconds()
 
-	if rs, ok := recs[1]; ok {
-		fmt.Println("\nTop-N usuario 1:")
-		for k, p := range rs {
-			fmt.Printf("%2d) MovieID=%d  r̂=%.3f\n", k+1, p.ID, p.Val)
-		}
+		tTotal := time.Since(t0).Seconds()
+		fmt.Printf("T_vecinos=%.2fs  T_pred=%.2fs  T_total=%.2fs\n", tVecinos, tPred, tTotal)
 	}
-
-	fmt.Printf("\nTiempo total: %.2fs\n", time.Since(t0).Seconds())
 }
