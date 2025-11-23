@@ -16,7 +16,7 @@ const (
 	MinOverlap  = 5
 	TopN        = 500
 	NumWorkers  = 16
-	RatingsPath = "ml-10m/ratings.dat"
+	RatingsPath = "ml-1m/ratings.dat"
 	ColdThresh  = 10 // menos de 10 ratings = cold-start
 )
 
@@ -416,8 +416,8 @@ func abs(x float64) float64 {
 	return x
 }
 
-// main
-func main() {
+// main, le cambiamos de nombre para poder usar los nodos
+func mainExperimentos() {
 	for _, max := range []int{1000000, 2000000, 5000000} {
 		fmt.Printf("\n=== Experimento con maxRatings=%d ===\n", max)
 
