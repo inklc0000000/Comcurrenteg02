@@ -1,0 +1,159 @@
+services:
+  # -----------------------
+  # MongoDB local (contenedor)
+  # -----------------------
+  mongo:
+    image: mongo:7
+    container_name: mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  # -----------------------
+  # Redis para caché
+  # -----------------------
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  # -----------------------
+  # Imagen base del backend (se construye una sola vez)
+  # -----------------------
+  node1:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: recomendador-backend
+    container_name: node1
+    restart: unless-stopped
+    command: ["/app/node"]
+    working_dir: /app
+    environment:
+      - PORT=9001
+      - NODE_ID=1
+      - SHARD_MOD=3
+      - SHARD_REM=0
+      #- MAX_SHARD_RATINGS=600000
+
+  node2:
+    image: recomendador-backend
+    container_name: node2
+    restart: unless-stopped
+    command: ["/app/node"]
+    working_dir: /app
+    environment:
+      - PORT=9002
+      - NODE_ID=2
+      - SHARD_MOD=3
+      - SHARD_REM=1
+      #- MAX_SHARD_RATINGS=600000
+
+  node3:
+    image: recomendador-backend
+    container_name: node3
+    restart: unless-stopped
+    command: ["/app/node"]
+    working_dir: /app
+    environment:
+      - PORT=9003
+      - NODE_ID=3
+      - SHARD_MOD=3
+      - SHARD_REM=2
+      #- MAX_SHARD_RATINGS=600000
+
+  # -----------------------
+  # API coordinadora
+  # -----------------------
+  api:
+    image: recomendador-backend
+    container_name: api
+    restart: unless-stopped
+    command: ["/app/api"]
+    working_dir: /app
+    depends_on:
+      - mongo
+      - redis
+      - node1
+      - node2
+      - node3
+    environment:
+      # IMPORTANTE: aquí dejamos de usar Atlas y usamos Mongo local
+      - MONGO_URI=mongodb://mongo:27017
+      - MONGO_DB=recomendador
+      - MONGO_COLL=recommendations
+      - MONGO_MOVIES_COLL=movies
+      - MONGO_USERS_COLL=users
+
+      - REDIS_ADDR=redis:6379
+
+      - NODE1_ADDR=node1:9001
+      - NODE2_ADDR=node2:9002
+      - NODE3_ADDR=node3:9003
+
+      - JWT_SECRET=soyadmin
+      - ADMIN_KEY=soyadmin
+
+      # Si tu API lee PORT de env, lo dejamos explícito
+      - PORT=8000
+    ports:
+      - "8000:8000"
+
+  # -----------------------
+  # Frontend Vite
+  # -----------------------
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: frontend
+    restart: unless-stopped
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000
+    depends_on:
+      - api
+    ports:
+      - "5173:5173"
+
+  # -----------------------
+  # Importador de usuarios
+  # -----------------------
+  import_users:
+    image: recomendador-backend
+    container_name: import_users
+    restart: "no"
+    working_dir: /app/ml-10m
+    command: ["/app/import_users"]
+    environment:
+      - MONGO_URI=mongodb://mongo:27017
+      - MONGO_DB=recomendador
+      - MONGO_USERS_COLL=users
+    depends_on:
+      - mongo
+
+  # -----------------------
+  # Importador de películas
+  # -----------------------
+  import_movies:
+    image: recomendador-backend
+    container_name: import_movies
+    restart: "no"
+    working_dir: /app/ml-10m
+    command: ["/app/import_movies"]
+    environment:
+      - MONGO_URI=mongodb://mongo:27017
+      - MONGO_DB=recomendador
+      - MONGO_MOVIES_COLL=movies
+    depends_on:
+      - mongo
+
+volumes:
+  mongo_data:
+  redis_data:

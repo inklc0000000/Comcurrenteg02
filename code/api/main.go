@@ -9,16 +9,20 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
 	redis "github.com/redis/go-redis/v9"
+	"github.com/shirou/gopsutil/v3/cpu"
 )
 
 // -------------------------------------------------------------------
@@ -31,8 +35,9 @@ type nodeRequest struct {
 }
 
 type Item struct {
-	MovieID int     `json:"movie_id" bson:"movie_id"`
-	Score   float64 `json:"score" bson:"score"`
+	MovieID int      `json:"movie_id" bson:"movie_id"`
+	Score   float64  `json:"score" bson:"score"`
+	Nodes   []string `json:"nodes,omitempty" bson:"nodes,omitempty"`
 }
 
 type NodeResponse struct {
@@ -49,6 +54,7 @@ var (
 	mongoRecColl    *mongo.Collection // historial de recomendaciones
 	mongoMoviesColl *mongo.Collection // catálogo de películas
 	mongoUsersColl  *mongo.Collection // usuarios (MovieLens 1M)
+	mongoAuditColl  *mongo.Collection // eventos de auditoría (bitácora)
 	redisClient     *redis.Client     // caché de recomendaciones
 )
 
@@ -68,13 +74,46 @@ type MovieDoc struct {
 	Genres  string `bson:"genres"` // "Comedy|Drama|..."
 }
 
-// Documento de usuario en Mongo (MovieLens 1M users.dat)
+// Documento de usuario en Mongo (MovieLens 10M)
 type UserDoc struct {
 	UserID     int    `bson:"user_id" json:"user_id"`
+	Name       string `bson:"name" json:"name"` // NUEVO, CREADO SINTETICAMENTE
 	Gender     string `bson:"gender" json:"gender"`
 	Age        int    `bson:"age" json:"age"`
 	Occupation int    `bson:"occupation" json:"occupation"`
 	ZipCode    string `bson:"zip_code" json:"zip_code"`
+}
+
+// Evento de auditoría para bitácora end-to-end
+type AuditEvent struct {
+	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	Timestamp time.Time          `bson:"timestamp" json:"timestamp"`
+	Type      string             `bson:"type" json:"type"`                 // "login", "recommendation", etc.
+	UserID    *int               `bson:"user_id,omitempty" json:"user_id"` // opcional
+	Detail    string             `bson:"detail" json:"detail"`             // descripción en texto
+}
+
+// logAuditEvent inserta un evento de auditoría en Mongo (si está configurado)
+func logAuditEvent(ctx context.Context, typ string, userID *int, detail string) {
+	if mongoAuditColl == nil {
+		// Sin Mongo para auditoría: solo logueamos en consola
+		log.Printf("[AUDIT:NO-MONGO] type=%s user_id=%v detail=%s\n", typ, userID, detail)
+		return
+	}
+
+	evt := AuditEvent{
+		Timestamp: time.Now(),
+		Type:      typ,
+		UserID:    userID,
+		Detail:    detail,
+	}
+
+	ctxIns, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	if _, err := mongoAuditColl.InsertOne(ctxIns, evt); err != nil {
+		log.Printf("[AUDIT] error insertando evento: %v\n", err)
+	}
 }
 
 // Respuesta enriquecida para HTTP
@@ -83,11 +122,68 @@ type MovieWithDetails struct {
 	Title   string   `json:"title"`
 	Genres  []string `json:"genres"`
 	Score   float64  `json:"score"`
+	Nodes   []string `json:"nodes,omitempty"`
 }
 
 type RecommendHTTPResponse struct {
 	UserID int                `json:"user_id"`
 	Items  []MovieWithDetails `json:"items"`
+}
+
+// -------------------------------------------------------------------
+// Tipos adicionales para /cluster/status y /metrics/benchmark
+// -------------------------------------------------------------------
+
+// Estado de un nodo individual del cluster
+type ClusterNodeStatus struct {
+	Addr          string   `json:"addr"`
+	Up            bool     `json:"up"`
+	LastLatencyMS *float64 `json:"last_latency_ms,omitempty"`
+}
+
+// Respuesta de /cluster/status
+type ClusterStatusResponse struct {
+	Nodes     []ClusterNodeStatus `json:"nodes"`
+	CheckedAt time.Time           `json:"checked_at"`
+}
+
+// Request para /metrics/benchmark
+type MetricsBenchmarkRequest struct {
+	Requests    int `json:"requests"`
+	Concurrency int `json:"concurrency"`
+	UserID      int `json:"user_id"`
+	TopN        int `json:"top_n"`
+}
+
+// Response de /metrics/benchmark
+type MetricsBenchmarkResponse struct {
+	TotalRequests int     `json:"total_requests"`
+	OK            int     `json:"ok"`
+	Errors        int     `json:"errors"`
+	TotalTimeSec  float64 `json:"total_time_sec"`
+	LatencyAvgMS  float64 `json:"latency_avg_ms"`
+	LatencyMinMS  float64 `json:"latency_min_ms"`
+	LatencyMaxMS  float64 `json:"latency_max_ms"`
+	RPS           float64 `json:"rps"`
+}
+
+type RedisMetricsResponse struct {
+	DBSize           int64 `json:"db_size"`
+	UsedMemoryBytes  int64 `json:"used_memory_bytes"`
+	ConnectedClients int64 `json:"connected_clients"`
+	KeyspaceHits     int64 `json:"keyspace_hits"`
+	KeyspaceMisses   int64 `json:"keyspace_misses"`
+}
+
+// -------------------------------------------------------------------
+// Tipo para /metrics/system
+// -------------------------------------------------------------------
+
+type SystemMetricsResponse struct {
+	CPUPercent    float64   `json:"cpu_percent"`
+	NumGoroutines int       `json:"num_goroutines"`
+	NumNodes      int       `json:"num_nodes"`
+	Timestamp     time.Time `json:"timestamp"`
 }
 
 func initMongo(ctx context.Context) error {
@@ -112,6 +208,10 @@ func initMongo(ctx context.Context) error {
 	if usersCollName == "" {
 		usersCollName = "users"
 	}
+	auditCollName := os.Getenv("MONGO_AUDIT_COLL") // NUEVO
+	if auditCollName == "" {
+		auditCollName = "audit_events"
+	}
 
 	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
 	if err != nil {
@@ -126,9 +226,10 @@ func initMongo(ctx context.Context) error {
 	mongoRecColl = db.Collection(recCollName)
 	mongoMoviesColl = db.Collection(moviesCollName)
 	mongoUsersColl = db.Collection(usersCollName)
+	mongoAuditColl = db.Collection(auditCollName)
 
-	log.Printf("[API] Conectado a MongoDB en %s, DB=%s, RecColl=%s, MoviesColl=%s, UsersColl=%s\n",
-		uri, dbName, recCollName, moviesCollName, usersCollName)
+	log.Printf("[API] Conectado a MongoDB en %s, DB=%s, RecColl=%s, MoviesColl=%s, UsersColl=%s, AuditColl=%s\n",
+		uri, dbName, recCollName, moviesCollName, usersCollName, auditCollName)
 	return nil
 }
 
@@ -250,7 +351,15 @@ func callAllNodes(cfg nodeConfig, userID, topN int) ([]Item, error) {
 			continue
 		}
 		hadSuccess = true
-		allItems = append(allItems, r.resp.Items...)
+
+		// etiquetamos cada ítem con el nodo que lo generó
+		for _, it := range r.resp.Items {
+			allItems = append(allItems, Item{
+				MovieID: it.MovieID,
+				Score:   it.Score,
+				Nodes:   []string{r.addr},
+			})
+		}
 	}
 
 	if !hadSuccess {
@@ -262,11 +371,32 @@ func callAllNodes(cfg nodeConfig, userID, topN int) ([]Item, error) {
 		return allItems, nil
 	}
 
-	// eliminar duplicados por movie_id y quedarnos con mayor score
+	// eliminar duplicados por movie_id, quedarnos con el mayor score
+	// y acumular el conjunto de nodos que aportaron esa película
 	bestByID := make(map[int]Item)
 	for _, it := range allItems {
-		if prev, ok := bestByID[it.MovieID]; !ok || it.Score > prev.Score {
+		if prev, ok := bestByID[it.MovieID]; !ok {
 			bestByID[it.MovieID] = it
+		} else {
+			// unificar nodos
+			nodeSet := make(map[string]struct{})
+			for _, n := range prev.Nodes {
+				nodeSet[n] = struct{}{}
+			}
+			for _, n := range it.Nodes {
+				nodeSet[n] = struct{}{}
+			}
+			mergedNodes := make([]string, 0, len(nodeSet))
+			for n := range nodeSet {
+				mergedNodes = append(mergedNodes, n)
+			}
+			sort.Strings(mergedNodes)
+
+			if it.Score > prev.Score {
+				prev.Score = it.Score
+			}
+			prev.Nodes = mergedNodes
+			bestByID[it.MovieID] = prev
 		}
 	}
 
@@ -290,6 +420,14 @@ func callAllNodes(cfg nodeConfig, userID, topN int) ([]Item, error) {
 // Enriquecimiento con detalles de películas
 // -------------------------------------------------------------------
 
+// -------------------------------------------------------------------
+// Enriquecimiento con detalles de películas
+// -------------------------------------------------------------------
+
+// -------------------------------------------------------------------
+// Enriquecimiento con detalles de películas
+// -------------------------------------------------------------------
+
 func enrichWithMovieDetails(ctx context.Context, items []Item) []MovieWithDetails {
 	// si no hay colección de películas, devolvemos solo IDs y scores
 	if mongoMoviesColl == nil || len(items) == 0 {
@@ -300,6 +438,7 @@ func enrichWithMovieDetails(ctx context.Context, items []Item) []MovieWithDetail
 				Title:   "",
 				Genres:  nil,
 				Score:   it.Score,
+				Nodes:   it.Nodes,
 			}
 		}
 		return out
@@ -328,6 +467,7 @@ func enrichWithMovieDetails(ctx context.Context, items []Item) []MovieWithDetail
 			out[i] = MovieWithDetails{
 				MovieID: it.MovieID,
 				Score:   it.Score,
+				Nodes:   it.Nodes,
 			}
 		}
 		return out
@@ -352,6 +492,7 @@ func enrichWithMovieDetails(ctx context.Context, items []Item) []MovieWithDetail
 			out[i] = MovieWithDetails{
 				MovieID: it.MovieID,
 				Score:   it.Score,
+				Nodes:   it.Nodes,
 			}
 			continue
 		}
@@ -364,6 +505,7 @@ func enrichWithMovieDetails(ctx context.Context, items []Item) []MovieWithDetail
 			Title:   md.Title,
 			Genres:  genres,
 			Score:   it.Score,
+			Nodes:   it.Nodes,
 		}
 	}
 	return out
@@ -427,6 +569,17 @@ func recommendHandler(cfg nodeConfig) http.HandlerFunc {
 
 			if err == nil {
 				log.Printf("[API] cache HIT Redis para key=%s\n", cacheKey)
+
+				// Auditoría: recomendaciones servidas desde cache
+				uid := userID
+				detail := fmt.Sprintf(
+					"Recomendaciones (cache HIT). Paso 1: la API recibe GET /recommend/%d?top_n=%d y valida el JWT del usuario. "+
+						"Paso 2: consulta Redis con key=%s y encuentra un Top-N precalculado. "+
+						"Paso 3: devuelve ese Top-N directamente al frontend sin llamar al cluster de nodos ML ni escribir nuevo historial en MongoDB.",
+					userID, topN, cacheKey,
+				)
+				logAuditEvent(r.Context(), "recommendation", &uid, detail)
+
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(cached))
 				return
@@ -497,6 +650,19 @@ func recommendHandler(cfg nodeConfig) http.HandlerFunc {
 			cancelSet()
 		}
 
+		// Auditoría: recomendaciones calculadas vía nodos ML y sharding por ítems
+		uid := userID
+		detail := fmt.Sprintf(
+			"Recomendaciones (cache MISS). Paso 1: la API recibe GET /recommend/%d?top_n=%d y valida el JWT del usuario. "+
+				"Paso 2: consulta Redis con key=%s y no encuentra resultados. "+
+				"Paso 3: realiza fan-out al cluster de nodos ML [%s,%s,%s]. Cada nodo almacena solo un shard de las películas "+
+				"(partición por ítems usando movie_id %% num_shards) y calcula el Top-N parcial sobre su shard. "+
+				"Paso 4: la API combina los Top-N parciales en un Top-N global, ordena por score y enriquece los resultados con títulos y géneros desde MongoDB (colección movies). "+
+				"Paso 5: guarda la recomendación en MongoDB (colección recommendations) como historial del usuario y devuelve el Top-N global al frontend.",
+			userID, topN, cacheKey, cfg.Node1Addr, cfg.Node2Addr, cfg.Node3Addr,
+		)
+		logAuditEvent(r.Context(), "recommendation", &uid, detail)
+
 		// --- 7) Enviar respuesta al cliente ---
 		w.Header().Set("Content-Type", "application/json")
 		if _, err := w.Write(respBytes); err != nil {
@@ -545,9 +711,67 @@ func historyHandler() http.HandlerFunc {
 			return
 		}
 
+		// Asegurar que no se encodee como null
+		if records == nil {
+			records = []RecommendationRecord{}
+		}
+		// Auditoría: consulta de historial
+		uid := userID
+		detail := fmt.Sprintf(
+			"Consulta de historial. Paso 1: la API recibe GET /history/%d y valida el JWT del usuario. "+
+				"Paso 2: lee en MongoDB (colección recommendations) las últimas %d recomendaciones del usuario, ordenadas por fecha descendente. "+
+				"Paso 3: devuelve la lista de recomendaciones al frontend.",
+			userID, len(records),
+		)
+		logAuditEvent(r.Context(), "history", &uid, detail)
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(records); err != nil {
 			log.Println("[API] error codificando historial HTTP:", err)
+		}
+	}
+}
+
+// GET /audit/latest?limit=50
+// Devuelve los últimos eventos de auditoría, ordenados por timestamp desc.
+func latestAuditHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if mongoAuditColl == nil {
+			http.Error(w, "auditoría no configurada", http.StatusServiceUnavailable)
+			return
+		}
+
+		limit := int64(50)
+		if qs := r.URL.Query().Get("limit"); qs != "" {
+			if v, err := strconv.Atoi(qs); err == nil && v > 0 {
+				limit = int64(v)
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+
+		opts := options.Find().
+			SetSort(bson.D{{Key: "timestamp", Value: -1}}).
+			SetLimit(limit)
+
+		cur, err := mongoAuditColl.Find(ctx, bson.D{}, opts)
+		if err != nil {
+			log.Printf("[AUDIT] error consultando eventos: %v\n", err)
+			http.Error(w, "error interno consultando auditoría", http.StatusInternalServerError)
+			return
+		}
+		defer cur.Close(ctx)
+
+		var events []AuditEvent
+		if err := cur.All(ctx, &events); err != nil {
+			log.Printf("[AUDIT] error leyendo cursor: %v\n", err)
+			http.Error(w, "error interno leyendo auditoría", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(events); err != nil {
+			log.Printf("[AUDIT] error codificando respuesta: %v\n", err)
 		}
 	}
 }
@@ -594,13 +818,381 @@ func userHandler() http.HandlerFunc {
 	}
 }
 
+// GET /cluster/status
+// Opcional: query ?user_id=X para probar con ese usuario (por defecto 1)
+func clusterStatusHandler(cfg nodeConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sampleUserID := 1
+		if qs := r.URL.Query().Get("user_id"); qs != "" {
+			if v, err := strconv.Atoi(qs); err == nil && v > 0 {
+				sampleUserID = v
+			}
+		}
+		topN := 1
+
+		addrs := []string{cfg.Node1Addr, cfg.Node2Addr, cfg.Node3Addr}
+
+		type nodeResult struct {
+			addr      string
+			up        bool
+			latencyMS float64
+		}
+
+		ch := make(chan nodeResult, len(addrs))
+
+		for _, addr := range addrs {
+			addr := addr
+			go func() {
+				start := time.Now()
+				_, err := callNode(addr, sampleUserID, topN)
+				if err != nil {
+					log.Printf("[API] error en cluster-status con nodo %s: %v\n", addr, err)
+					ch <- nodeResult{addr: addr, up: false, latencyMS: 0}
+					return
+				}
+				dur := time.Since(start)
+				ch <- nodeResult{
+					addr:      addr,
+					up:        true,
+					latencyMS: dur.Seconds() * 1000,
+				}
+			}()
+		}
+
+		var nodes []ClusterNodeStatus
+		for i := 0; i < len(addrs); i++ {
+			r := <-ch
+			var latPtr *float64
+			if r.up {
+				lat := r.latencyMS
+				latPtr = &lat
+			}
+			nodes = append(nodes, ClusterNodeStatus{
+				Addr:          r.addr,
+				Up:            r.up,
+				LastLatencyMS: latPtr,
+			})
+		}
+
+		resp := ClusterStatusResponse{
+			Nodes:     nodes,
+			CheckedAt: time.Now(),
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Println("[API] error codificando cluster status:", err)
+		}
+	}
+}
+
+// POST /metrics/benchmark
+// Body JSON: { "requests": 100, "concurrency": 10, "user_id": 1, "top_n": 20 }
+func metricsBenchmarkHandler(apiBaseURL string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "método no permitido, use POST", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req MetricsBenchmarkRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "body JSON inválido", http.StatusBadRequest)
+			return
+		}
+
+		// Valores por defecto y límites razonables
+		if req.Requests <= 0 {
+			req.Requests = 50
+		}
+		if req.Requests > 1000 {
+			req.Requests = 1000
+		}
+		if req.Concurrency <= 0 {
+			req.Concurrency = 10
+		}
+		if req.Concurrency > req.Requests {
+			req.Concurrency = req.Requests
+		}
+		if req.TopN <= 0 {
+			req.TopN = 20
+		}
+		if req.UserID <= 0 {
+			req.UserID = 1
+		}
+
+		totalRequests := req.Requests
+		concurrency := req.Concurrency
+
+		type benchResult struct {
+			ok       bool
+			duration time.Duration
+			err      error
+			status   int
+		}
+
+		results := make([]benchResult, totalRequests)
+		jobs := make(chan int)
+
+		client := &http.Client{
+			Timeout: 15 * time.Second,
+		}
+
+		// Reutilizamos el mismo Authorization que llegó a /metrics/benchmark
+		authHeader := r.Header.Get("Authorization")
+
+		var wg sync.WaitGroup
+		startAll := time.Now()
+
+		// Lanzar workers
+		for wID := 0; wID < concurrency; wID++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range jobs {
+					url := fmt.Sprintf("%s/recommend/%d?top_n=%d", apiBaseURL, req.UserID, req.TopN)
+
+					httpReq, err := http.NewRequest(http.MethodGet, url, nil)
+					if err != nil {
+						results[i] = benchResult{ok: false, duration: 0, err: err, status: 0}
+						continue
+					}
+					if authHeader != "" {
+						httpReq.Header.Set("Authorization", authHeader)
+					}
+
+					startReq := time.Now()
+					resp, err := client.Do(httpReq)
+					dur := time.Since(startReq)
+
+					res := benchResult{
+						ok:       false,
+						duration: dur,
+						err:      err,
+						status:   0,
+					}
+
+					if err == nil {
+						res.status = resp.StatusCode
+						if resp.StatusCode == http.StatusOK {
+							res.ok = true
+						}
+						_ = resp.Body.Close()
+					}
+
+					results[i] = res
+				}
+			}()
+		}
+
+		// Enviar trabajos
+		for i := 0; i < totalRequests; i++ {
+			jobs <- i
+		}
+		close(jobs)
+
+		wg.Wait()
+		totalTime := time.Since(startAll)
+
+		var (
+			okCount  int
+			errCount int
+			sumDur   time.Duration
+			minDur   time.Duration
+			maxDur   time.Duration
+			first    bool
+		)
+
+		for _, rRes := range results {
+			if rRes.err != nil || !rRes.ok {
+				errCount++
+				continue
+			}
+			okCount++
+			sumDur += rRes.duration
+			if !first {
+				minDur = rRes.duration
+				maxDur = rRes.duration
+				first = true
+			} else {
+				if rRes.duration < minDur {
+					minDur = rRes.duration
+				}
+				if rRes.duration > maxDur {
+					maxDur = rRes.duration
+				}
+			}
+		}
+
+		resp := MetricsBenchmarkResponse{
+			TotalRequests: totalRequests,
+			OK:            okCount,
+			Errors:        errCount,
+			TotalTimeSec:  totalTime.Seconds(),
+			LatencyAvgMS:  0,
+			LatencyMinMS:  0,
+			LatencyMaxMS:  0,
+			RPS:           0,
+		}
+
+		if okCount > 0 {
+			avg := sumDur / time.Duration(okCount)
+			resp.LatencyAvgMS = avg.Seconds() * 1000
+			resp.LatencyMinMS = minDur.Seconds() * 1000
+			resp.LatencyMaxMS = maxDur.Seconds() * 1000
+			resp.RPS = float64(okCount) / totalTime.Seconds()
+		}
+
+		log.Printf("[API] benchmark: req=%d conc=%d user_id=%d top_n=%d OK=%d ERR=%d total=%.3fs avg=%.3fms\n",
+			totalRequests, concurrency, req.UserID, req.TopN, okCount, errCount, totalTime.Seconds(), resp.LatencyAvgMS,
+		)
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Println("[API] error codificando respuesta benchmark:", err)
+		}
+	}
+}
+
+// GET /metrics/system
+// Devuelve métricas simples del sistema: uso CPU, goroutines, número de nodos.
+func systemMetricsHandler(cfg nodeConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Medir % CPU usando gopsutil. Intervalo 0 → cálculo inmediato desde la última llamada.
+		// Es suficiente para el propósito del proyecto.
+		cpuPercents, err := cpu.Percent(0, false)
+		var cpuPercent float64
+		if err != nil || len(cpuPercents) == 0 {
+			log.Printf("[API] error obteniendo CPU percent: %v\n", err)
+			cpuPercent = 0
+		} else {
+			cpuPercent = cpuPercents[0]
+		}
+
+		// Número de goroutines de la API
+		numGoroutines := runtime.NumGoroutine()
+
+		// Número de nodos configurados en la API
+		numNodes := 0
+		if cfg.Node1Addr != "" {
+			numNodes++
+		}
+		if cfg.Node2Addr != "" {
+			numNodes++
+		}
+		if cfg.Node3Addr != "" {
+			numNodes++
+		}
+
+		resp := SystemMetricsResponse{
+			CPUPercent:    cpuPercent,
+			NumGoroutines: numGoroutines,
+			NumNodes:      numNodes,
+			Timestamp:     time.Now(),
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Println("[API] error codificando system metrics:", err)
+		}
+	}
+}
+
+func redisMetricsHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if redisClient == nil {
+			http.Error(w, "Redis no está configurado", http.StatusServiceUnavailable)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		dbSize, err := redisClient.DBSize(ctx).Result()
+		if err != nil {
+			log.Printf("[API] error obteniendo DBSize de Redis: %v\n", err)
+			http.Error(w, "error consultando Redis", http.StatusInternalServerError)
+			return
+		}
+
+		infoStr, err := redisClient.Info(ctx, "memory", "stats").Result()
+		if err != nil {
+			log.Printf("[API] error obteniendo INFO de Redis: %v\n", err)
+			http.Error(w, "error consultando Redis", http.StatusInternalServerError)
+			return
+		}
+
+		metrics := RedisMetricsResponse{
+			DBSize: dbSize,
+		}
+
+		lines := strings.Split(infoStr, "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) != 2 {
+				continue
+			}
+
+			key := parts[0]
+			valStr := parts[1]
+
+			switch key {
+			case "used_memory":
+				if v, err := strconv.ParseInt(valStr, 10, 64); err == nil {
+					metrics.UsedMemoryBytes = v
+				}
+			case "connected_clients":
+				if v, err := strconv.ParseInt(valStr, 10, 64); err == nil {
+					metrics.ConnectedClients = v
+				}
+			case "keyspace_hits":
+				if v, err := strconv.ParseInt(valStr, 10, 64); err == nil {
+					metrics.KeyspaceHits = v
+				}
+			case "keyspace_misses":
+				if v, err := strconv.ParseInt(valStr, 10, 64); err == nil {
+					metrics.KeyspaceMisses = v
+				}
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(metrics); err != nil {
+			log.Println("[API] error codificando Redis metrics:", err)
+		}
+	}
+}
+
+// Middleware simple de CORS para permitir llamadas desde el frontend (localhost:5173)
+func withCORS(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Origen permitido: tu frontend Vite
+		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:5173")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		// Manejo de preflight (OPTIONS)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		h.ServeHTTP(w, r)
+	})
+}
+
 // -------------------------------------------------------------------
 // main de la API
 // -------------------------------------------------------------------
 
 func main() {
 	cfg := loadNodeConfig()
-
+	initJWT()
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8000"
@@ -615,18 +1207,37 @@ func main() {
 		log.Printf("[API] Advertencia: no se pudo conectar a Redis: %v\n", err)
 	}
 
+	// Base URL para el benchmark (normalmente http://localhost:PORT)
+	apiBaseURL := os.Getenv("BENCHMARK_BASE_URL")
+	if apiBaseURL == "" {
+		apiBaseURL = "http://localhost:" + port
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
+	mux.Handle("/auth/login", loginHandler())
+
+	// rutas protegidas por JWT (via authMiddleware global)
 	mux.Handle("/recommend/", recommendHandler(cfg))
 	mux.Handle("/history/", historyHandler())
 	mux.Handle("/users/", userHandler())
+	mux.Handle("/cluster/status", adminOnly(clusterStatusHandler(cfg)))
+	mux.Handle("/metrics/benchmark", adminOnly(metricsBenchmarkHandler(apiBaseURL)))
+	mux.Handle("/metrics/system", adminOnly(systemMetricsHandler(cfg)))
+	mux.Handle("/metrics/redis", adminOnly(redisMetricsHandler()))
+	mux.Handle("/audit/latest", adminOnly(latestAuditHandler()))
 
+	// NUEVA ruta WebSocket (solo admin, se valida dentro del handler vía token query)
+	mux.Handle("/ws/metrics", metricsWSHandler(cfg))
+
+	handler := authMiddleware(mux)
+	handler = withCORS(handler)
 	addr := ":" + port
 	log.Printf("[API] Iniciando API en %s\n", addr)
 	log.Printf("[API] Nodo1: %s, Nodo2: %s, Nodo3: %s\n",
 		cfg.Node1Addr, cfg.Node2Addr, cfg.Node3Addr)
 
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatal("[API] error en ListenAndServe:", err)
 	}
 }

@@ -14,7 +14,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-const MoviesPath = "../ml-1m/movies.dat"
+const MoviesPath = "../ml-10m/movies.dat"
 
 type MovieDoc struct {
 	MovieID int    `bson:"movie_id"`
