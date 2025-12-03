@@ -10,23 +10,36 @@ import (
 	"strings"
 	"time"
 
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-const UsersPath = "../ml-1m/users.dat"
-
 type UserDoc struct {
-	UserID     int    `bson:"user_id"`
-	Gender     string `bson:"gender"`
-	Age        int    `bson:"age"`
-	Occupation int    `bson:"occupation"`
-	ZipCode    string `bson:"zip_code"`
+	UserID     int       `bson:"user_id"`
+	Name       string    `bson:"name"`
+	Gender     string    `bson:"gender"`
+	Age        int       `bson:"age"`
+	Occupation int       `bson:"occupation"`
+	ZipCode    string    `bson:"zip_code"`
+	CreatedAt  time.Time `bson:"created_at"`
+}
+
+// syntheticName genera un nombre determinista a partir del userID
+func syntheticName(userID int) string {
+	firstNames := []string{"Alex", "María", "Luis", "Carla", "Diego", "Lucía", "Javier", "Ana"}
+	lastNames := []string{"García", "Pérez", "Rodríguez", "López", "Fernández", "Sánchez", "Torres", "Ramírez"}
+
+	i := userID % len(firstNames)
+	j := (userID / len(firstNames)) % len(lastNames)
+
+	return fmt.Sprintf("%s %s", firstNames[i], lastNames[j])
 }
 
 func main() {
-	fmt.Println("=== Importador de usuarios a MongoDB ===")
+	ctx := context.Background()
 
+	// Mismos defaults que usa la API
 	uri := os.Getenv("MONGO_URI")
 	if uri == "" {
 		uri = "mongodb://localhost:27017"
@@ -35,116 +48,118 @@ func main() {
 	if dbName == "" {
 		dbName = "recomendador"
 	}
-	collName := os.Getenv("MONGO_USERS_COLL")
-	if collName == "" {
-		collName = "users"
+	usersCollName := os.Getenv("MONGO_USERS_COLL")
+	if usersCollName == "" {
+		usersCollName = "users"
 	}
 
-	fmt.Printf("Usando MONGO_URI=%s\n", uri)
-	fmt.Printf("DB=%s, Coll=%s\n", dbName, collName)
-	fmt.Printf("Leyendo archivo de usuarios: %s\n", UsersPath)
-
-	// Conexión a MongoDB (más tiempo porque es un proceso de importación)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+	log.Printf("[import_users] Conectando a MongoDB: %s, DB=%s, Coll=%s\n", uri, dbName, usersCollName)
 
 	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
 	if err != nil {
-		log.Fatalf("Error conectando a Mongo: %v", err)
+		log.Fatalf("error conectando a Mongo: %v", err)
 	}
-	defer client.Disconnect(ctx)
+	defer func() {
+		_ = client.Disconnect(context.Background())
+	}()
 
 	if err := client.Ping(ctx, nil); err != nil {
-		log.Fatalf("Error haciendo ping a Mongo: %v", err)
+		log.Fatalf("error haciendo ping a Mongo: %v", err)
 	}
 
-	db := client.Database(dbName)
-	coll := db.Collection(collName)
+	coll := client.Database(dbName).Collection(usersCollName)
 
-	// Limpiar colección antes de importar
-	if err := coll.Drop(ctx); err != nil {
-		log.Printf("Advertencia: no se pudo hacer Drop de %s: %v\n", collName, err)
-	} else {
-		log.Printf("Colección %s limpiada (Drop OK)\n", collName)
+	// Vaciar colección para reimportar limpia
+	{
+		ctxClear, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		res, err := coll.DeleteMany(ctxClear, bson.D{})
+		if err != nil {
+			log.Fatalf("error limpiando colección users: %v", err)
+		}
+		log.Printf("[import_users] Colección limpiada, documentos eliminados: %d\n", res.DeletedCount)
 	}
 
-	file, err := os.Open(UsersPath)
+	// Ruta del archivo
+	path := "../ml-10m/users_synth.dat"
+	if len(os.Args) > 1 {
+		path = os.Args[1]
+	}
+
+	f, err := os.Open(path)
 	if err != nil {
-		log.Fatalf("No se pudo abrir %s: %v", UsersPath, err)
+		log.Fatalf("no se pudo abrir %s: %v", path, err)
 	}
-	defer file.Close()
+	defer f.Close()
 
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(f)
+	batch := make([]interface{}, 0, 1000)
 
-	var docs []interface{}
-	count := 0
+	totalLines := 0
+	totalDocs := 0
 
 	for scanner.Scan() {
-		line := scanner.Text()
-		// Formato MovieLens 1M: UserID::Gender::Age::Occupation::Zip-code
-		parts := strings.SplitN(line, "::", 5)
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		totalLines++
+
+		parts := strings.Split(line, "::")
 		if len(parts) != 5 {
-			log.Printf("Línea ignorada (formato inválido): %s\n", line)
+			log.Printf("[WARN] línea %d con formato inesperado: %q\n", totalLines, line)
 			continue
 		}
 
-		idStr := parts[0]
+		userID, err := strconv.Atoi(parts[0])
+		if err != nil {
+			log.Printf("[WARN] user_id inválido en línea %d: %q\n", totalLines, line)
+			continue
+		}
 		gender := parts[1]
-		ageStr := parts[2]
-		occStr := parts[3]
-		zip := parts[4]
-
-		userID, err := strconv.Atoi(idStr)
+		age, err := strconv.Atoi(parts[2])
 		if err != nil {
-			log.Printf("UserID inválido (%s) en línea: %s\n", idStr, line)
+			log.Printf("[WARN] edad inválida en línea %d: %q\n", totalLines, line)
 			continue
 		}
-
-		age, err := strconv.Atoi(ageStr)
+		occ, err := strconv.Atoi(parts[3])
 		if err != nil {
-			log.Printf("Age inválido (%s) en línea: %s\n", ageStr, line)
+			log.Printf("[WARN] ocupación inválida en línea %d: %q\n", totalLines, line)
 			continue
 		}
-
-		occ, err := strconv.Atoi(occStr)
-		if err != nil {
-			log.Printf("Occupation inválido (%s) en línea: %s\n", occStr, line)
-			continue
-		}
+		zipCode := parts[4]
 
 		doc := UserDoc{
 			UserID:     userID,
+			Name:       syntheticName(userID),
 			Gender:     gender,
 			Age:        age,
 			Occupation: occ,
-			ZipCode:    zip,
+			ZipCode:    zipCode,
+			CreatedAt:  time.Now(),
 		}
 
-		docs = append(docs, doc)
-		count++
-
-		// Insertar en lotes de 1000 (igual que import_movies.go)
-		if len(docs) >= 1000 {
-			if err := insertBatch(ctx, coll, docs); err != nil {
-				log.Fatalf("Error al insertar batch: %v", err)
+		batch = append(batch, doc)
+		if len(batch) >= 1000 {
+			if err := insertBatch(ctx, coll, batch); err != nil {
+				log.Fatalf("error insertando batch: %v", err)
 			}
-			docs = docs[:0]
+			totalDocs += len(batch)
+			batch = batch[:0]
 		}
 	}
-
 	if err := scanner.Err(); err != nil {
-		log.Fatalf("Error leyendo archivo: %v", err)
+		log.Fatalf("error leyendo archivo %s: %v", path, err)
 	}
 
-	// Insertar lo que quedó
-	if len(docs) > 0 {
-		if err := insertBatch(ctx, coll, docs); err != nil {
-			log.Fatalf("Error al insertar último batch: %v", err)
+	if len(batch) > 0 {
+		if err := insertBatch(ctx, coll, batch); err != nil {
+			log.Fatalf("error insertando batch final: %v", err)
 		}
+		totalDocs += len(batch)
 	}
 
-	fmt.Printf("Importación completada. Usuarios insertados: %d\n", count)
-	fmt.Println("=== Fin importador ===")
+	log.Printf("[import_users] Importación completada. Líneas leídas: %d, documentos insertados: %d\n", totalLines, totalDocs)
 }
 
 func insertBatch(ctx context.Context, coll *mongo.Collection, docs []interface{}) error {
@@ -158,6 +173,6 @@ func insertBatch(ctx context.Context, coll *mongo.Collection, docs []interface{}
 	if err != nil {
 		return fmt.Errorf("InsertMany falló: %w", err)
 	}
-	log.Printf("Batch insertado: %d documentos\n", len(docs))
+	log.Printf("[import_users] Batch insertado: %d documentos\n", len(docs))
 	return nil
 }

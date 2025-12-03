@@ -45,20 +45,92 @@ var (
 	shardRem int = 0
 )
 
+// buildUserRawShard filtra los ratings por shard (según shardMod/shardRem)
+// y construye userRaw solo con los ítems que pertenecen a este nodo.
+// Además, si existe la variable de entorno MAX_SHARD_RATINGS y es > 0,
+// limita el número de ratings que se usan en este shard.
+func buildUserRawShard(ratings [][3]int, shardMod, shardRem int) map[int]map[int]int {
+	// Si no hay sharding, usamos el modelo completo.
+	if shardMod <= 1 {
+		return buildUserRaw(ratings)
+	}
+
+	// Leer límite opcional por shard desde ENV
+	shardLimit := -1 // -1 = sin límite
+	if v := os.Getenv("MAX_SHARD_RATINGS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			shardLimit = n
+		}
+	}
+
+	filtrados := make([][3]int, 0)
+	totalShard := 0
+
+	for _, t := range ratings {
+		movieID := t[1]
+
+		// Este rating no pertenece a este shard
+		if movieID%shardMod != shardRem {
+			continue
+		}
+
+		totalShard++
+
+		// Si hay límite y ya lo alcanzamos, dejamos de añadir
+		if shardLimit > 0 && len(filtrados) >= shardLimit {
+			continue
+		}
+
+		filtrados = append(filtrados, t)
+	}
+
+	if len(filtrados) == 0 {
+		log.Fatalf("[NODE] no hay ratings para este shard (mod=%d, rem=%d)", shardMod, shardRem)
+	}
+
+	log.Printf(
+		"[NODE] Ratings filtrados para shard (mod=%d, rem=%d): %d usados de %d disponibles (limit=%d)\n",
+		shardMod, shardRem, len(filtrados), totalShard, shardLimit,
+	)
+	// Reutilizamos la construcción concurrente original sobre el subconjunto
+	return buildUserRaw(filtrados)
+}
+
 // initModel construye el modelo una sola vez al arrancar el nodo.
 func initModel(maxRatings int) {
 	start := time.Now()
+
+	// Cargar edades (solo una vez)
+	if userAgeIdx == nil {
+		ages, err := loadUserAges(UsersPath)
+		if err != nil {
+			log.Fatalf("[NODE] error cargando edades de usuarios: %v", err)
+		}
+		userAgeIdx = ages
+		log.Printf("[NODE] Edades de usuarios cargadas: %d\n", len(ages))
+	}
+
 	fmt.Println("[NODE] Cargando ratings desde", RatingsPath, "...")
 	ratings := readRatings(RatingsPath, maxRatings)
 	fmt.Printf("[NODE] Ratings cargados: %d\n", len(ratings))
 
-	// Mismas etapas que en el main para los experimentos
-	modelUserRaw = buildUserRaw(ratings)
+	// Aplicar sharding en la construcción de la matriz dispersa
+	modelUserRaw = buildUserRawShard(ratings, shardMod, shardRem)
+	fmt.Printf("[NODE] Usuarios en este shard: %d\n", len(modelUserRaw))
+
+	// Soltar el slice grande: a partir de aquí no se usa en el nodo
+	ratings = nil
+
+	// Construir el resto de estructuras del modelo optimizado
 	modelMeans = userMeans(modelUserRaw)
-	userNorm := buildUserNorm(modelUserRaw, modelMeans)
 	inv := buildInverted(modelUserRaw)
 	modelGlobal = globalTopMovies(modelUserRaw)
-	modelNeighbors = topKNeighbors(userNorm, inv)
+
+	// Nuevo topKNeighbors: definido en cf_user-based.go
+	modelNeighbors = topKNeighbors(modelUserRaw, modelMeans, inv)
+
+	// Ya no necesitamos inv una vez construidos los vecinos
+	inv = nil
 
 	fmt.Printf("[NODE] Modelo construido en %.2fs\n", time.Since(start).Seconds())
 }
@@ -219,7 +291,7 @@ func main() {
 
 	// Se puede ajustar este límite según las pruebas de rendimiento previas.
 	// Para MovieLens 1M usamos 1000000, para 10M solo se usa hasta la mitad por el alto costo de computo y la PC se cuelga.
-	maxRatings := 1000000
+	maxRatings := 5000000
 
 	fmt.Printf("[NODE %s] Inicializando modelo...\n", nodeID)
 	initModel(maxRatings)

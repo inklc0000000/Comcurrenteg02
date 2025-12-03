@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -16,9 +17,11 @@ const (
 	MinOverlap  = 5
 	TopN        = 500
 	NumWorkers  = 16
-	RatingsPath = "ml-1m/ratings.dat"
+	RatingsPath = "ml-10m/ratings.dat"
 	ColdThresh  = 10 // menos de 10 ratings = cold-start
 )
+
+const UsersPath = "ml-10m/users_synth.dat"
 
 // estructuras
 type Pair struct {
@@ -30,6 +33,67 @@ type Sim struct {
 	V   int
 	S   float64
 	Cnt int
+}
+
+var (
+	// userAgeIdx: user_id -> índice de rango de edad (0..6)
+	userAgeIdx map[int]int
+
+	ageCodeToIdx = map[int]int{
+		1:  0, // Under 18
+		18: 1, // 18-24
+		25: 2, // 25-34
+		35: 3, // 35-44
+		45: 4, // 45-49
+		50: 5, // 50-55
+		56: 6, // 56+
+	}
+)
+
+// loadUserAges lee users_synth.dat y construye userAgeIdx: user_id -> índice de edad
+func loadUserAges(path string) (map[int]int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	ages := make(map[int]int, 6000)
+
+	scanner := bufio.NewScanner(f)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "::")
+		if len(parts) != 5 {
+			// formato inesperado, la saltamos
+			continue
+		}
+
+		userID, err := strconv.Atoi(parts[0])
+		if err != nil {
+			continue
+		}
+		ageCode, err := strconv.Atoi(parts[2])
+		if err != nil {
+			continue
+		}
+
+		idx, ok := ageCodeToIdx[ageCode]
+		if !ok {
+			// código de edad no mapeado, la ignoramos
+			continue
+		}
+		ages[userID] = idx
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return ages, nil
 }
 
 // Lectura ratings.dat
@@ -223,6 +287,40 @@ func buildInverted(userRaw map[int]map[int]int) map[int][]int {
 	return inv
 }
 
+const (
+	lambdaAge = 0.2 // peso de la similitud de edad en la mezcla total
+	tauAge    = 2.0 // controla cuánto penaliza diferencias de rango de edad
+)
+
+// simDemo devuelve una similitud en [~0.37, 1] según la diferencia de rango de edad.
+func simDemo(uID, vID int) float64 {
+	if userAgeIdx == nil {
+		return 0
+	}
+	iu, okU := userAgeIdx[uID]
+	iv, okV := userAgeIdx[vID]
+	if !okU || !okV {
+		return 0
+	}
+	d := float64(iu - iv)
+	if d < 0 {
+		d = -d
+	}
+	return math.Exp(-d / tauAge)
+}
+
+// simTotal mezcla la similitud CF (Pearson) con la similitud de edad.
+func simTotal(uID, vID int, simCF float64) float64 {
+	if simCF <= 0 {
+		return simCF
+	}
+	sDemo := simDemo(uID, vID)
+	if sDemo <= 0 {
+		return simCF
+	}
+	return (1-lambdaAge)*simCF + lambdaAge*sDemo
+}
+
 // Pearson
 func pearson(uMap, vMap map[int]float64) (float64, int) {
 	num, denU, denV := 0.0, 0.0, 0.0
@@ -244,6 +342,51 @@ func pearson(uMap, vMap map[int]float64) (float64, int) {
 	return num / (sqrt(denU) * sqrt(denV)), cnt
 }
 
+// pearsonFromRaw calcula Pearson a partir de las calificaciones enteras
+// y las medias de cada usuario, sin necesidad de userNorm.
+func pearsonFromRaw(
+	uID, vID int,
+	userRaw map[int]map[int]int,
+	means map[int]float64,
+) (float64, int) {
+	uMap, okU := userRaw[uID]
+	vMap, okV := userRaw[vID]
+	if !okU || !okV {
+		return 0, 0
+	}
+
+	mu := means[uID]
+	mv := means[vID]
+
+	// Para ahorrar operaciones, iteramos sobre el mapa más pequeño.
+	if len(uMap) > len(vMap) {
+		uMap, vMap = vMap, uMap
+		mu, mv = mv, mu
+	}
+
+	var num, denU, denV float64
+	cnt := 0
+
+	for i, ru := range uMap {
+		rv, ok := vMap[i]
+		if !ok {
+			continue
+		}
+		du := float64(ru) - mu
+		dv := float64(rv) - mv
+
+		num += du * dv
+		denU += du * du
+		denV += dv * dv
+		cnt++
+	}
+
+	if cnt < MinOverlap || denU == 0 || denV == 0 {
+		return 0, cnt
+	}
+	return num / (sqrt(denU) * sqrt(denV)), cnt
+}
+
 func sqrt(x float64) float64 {
 	if x <= 0 {
 		return 0
@@ -256,9 +399,13 @@ func sqrt(x float64) float64 {
 }
 
 // top-K vecinos concurrentes
-func topKNeighbors(userNorm map[int]map[int]float64, inv map[int][]int) map[int][]Sim {
-	users := make([]int, 0, len(userNorm))
-	for u := range userNorm {
+func topKNeighbors(
+	userRaw map[int]map[int]int,
+	means map[int]float64,
+	inv map[int][]int,
+) map[int][]Sim {
+	users := make([]int, 0, len(userRaw))
+	for u := range userRaw {
 		users = append(users, u)
 	}
 
@@ -270,30 +417,38 @@ func topKNeighbors(userNorm map[int]map[int]float64, inv map[int][]int) map[int]
 	worker := func() {
 		defer wg.Done()
 		for u := range tasks {
+			// candidatos: usuarios que comparten al menos 1 ítem con u
 			candSet := make(map[int]struct{})
-			for i := range userNorm[u] {
+			for i := range userRaw[u] {
 				for _, v := range inv[i] {
 					if v != u {
 						candSet[v] = struct{}{}
 					}
 				}
 			}
+
 			sims := make([]Sim, 0, 64)
 			for v := range candSet {
-				s, cnt := pearson(userNorm[u], userNorm[v])
-				if s != 0 {
-					sims = append(sims, Sim{V: v, S: s, Cnt: cnt})
+				sCF, cnt := pearsonFromRaw(u, v, userRaw, means)
+				if sCF <= 0 {
+					continue
+				}
+				s := simTotal(u, v, sCF)
+				if s <= 0 {
+					continue
+				}
+				sims = append(sims, Sim{V: v, S: s, Cnt: cnt})
+			}
+
+			if len(sims) > 0 {
+				sort.Slice(sims, func(i, j int) bool {
+					return sims[i].S > sims[j].S
+				})
+				if len(sims) > KNeighbors {
+					sims = sims[:KNeighbors]
 				}
 			}
-			sort.Slice(sims, func(i, j int) bool {
-				if sims[i].S == sims[j].S {
-					return sims[i].Cnt > sims[j].Cnt
-				}
-				return sims[i].S > sims[j].S
-			})
-			if len(sims) > KNeighbors {
-				sims = sims[:KNeighbors]
-			}
+
 			mu.Lock()
 			out[u] = sims
 			mu.Unlock()
@@ -418,6 +573,14 @@ func abs(x float64) float64 {
 
 // main, le cambiamos de nombre para poder usar los nodos
 func mainExperimentos() {
+	if userAgeIdx == nil {
+		ages, err := loadUserAges(UsersPath)
+		if err != nil {
+			panic(fmt.Errorf("error cargando edades de usuarios: %w", err))
+		}
+		fmt.Printf("Edades de usuarios cargadas: %d\n", len(ages))
+		userAgeIdx = ages
+	}
 	for _, max := range []int{1000000, 2000000, 5000000} {
 		fmt.Printf("\n=== Experimento con maxRatings=%d ===\n", max)
 
@@ -428,12 +591,14 @@ func mainExperimentos() {
 
 		userRaw := buildUserRaw(ratings)
 		means := userMeans(userRaw)
-		userNorm := buildUserNorm(userRaw, means)
+		// buildUserNorm puedes dejarlo solo si quieres comparar vs la versión antigua,
+		// pero para el modelo optimizado ya no lo necesitas.
+		// userNorm := buildUserNorm(userRaw, means)
 		inv := buildInverted(userRaw)
 		global := globalTopMovies(userRaw)
 
 		t1 := time.Now()
-		neighbors := topKNeighbors(userNorm, inv)
+		neighbors := topKNeighbors(userRaw, means, inv)
 		tVecinos := time.Since(t1).Seconds()
 
 		t2 := time.Now()

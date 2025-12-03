@@ -1,0 +1,48 @@
+# Dockerfile.backend
+# Construye:
+#   - /app/api           -> API HTTP + WebSocket
+#   - /app/node          -> nodo ML
+#   - /app/import_users  -> importador de usuarios
+#   - /app/import_movies -> importador de películas
+
+# Ajusta la versión de Go para que coincida con la de tus go.mod
+FROM golang:1.25 AS builder
+ENV GOTOOLCHAIN=auto
+
+WORKDIR /src
+COPY . .
+
+# ---------- Build de la API (módulo api/) ----------
+WORKDIR /src/api
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/api .
+
+# ---------- Build de los nodos (módulo raíz TF/) ----------
+WORKDIR /src
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/node node.go cf_user-based.go
+
+# ---------- Build de los importadores (Collection imports/) ----------
+WORKDIR "/src/Collection imports"
+RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/import_users import_users.go && \
+    CGO_ENABLED=0 GOOS=linux go build -o /bin/import_movies import_movies.go
+
+# ---------- Imagen mínima de runtime ----------
+FROM gcr.io/distroless/base-debian12
+
+WORKDIR /app
+
+# Binarios
+COPY --from=builder /bin/api /app/api
+COPY --from=builder /bin/node /app/node
+COPY --from=builder /bin/import_users /app/import_users
+COPY --from=builder /bin/import_movies /app/import_movies
+
+# Dataset MovieLens 10M
+COPY ml-10m /app/ml-10m
+
+# Puertos típicos (no son obligatorios pero ayudan a documentar)
+EXPOSE 8000 9001 9002 9003
+
+# Por defecto, si alguien ejecuta esta imagen sin command, arranca la API
+CMD ["/app/api"]
